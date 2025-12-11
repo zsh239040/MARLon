@@ -63,6 +63,8 @@ def learn(
     tb_log_name: str = "OnPolicyAlgorithm",
     eval_log_path: Optional[str] = None,
     reset_num_timesteps: bool = True,
+    checkpoint_callback: Optional[callable] = None,
+    checkpoint_interval: int = 0,
 ):
     '''
     Train an attacker and defender agent in a multi-agent scenario.
@@ -101,6 +103,8 @@ def learn(
         eval_log_path, reset_num_timesteps, tb_log_name
     )
 
+    last_checkpoint_iteration: Optional[int] = None
+
     while attacker_agent.num_timesteps < total_timesteps1 and \
         defender_agent.num_timesteps < total_timesteps2:
 
@@ -125,8 +129,17 @@ def learn(
         attacker_agent.train()
         defender_agent.train()
 
+        if checkpoint_callback and checkpoint_interval > 0 and iteration % checkpoint_interval == 0:
+            checkpoint_callback(iteration)
+            last_checkpoint_iteration = iteration
+
     attacker_agent.on_training_end()
     defender_agent.on_training_end()
+
+    if checkpoint_callback and last_checkpoint_iteration != iteration:
+        checkpoint_callback(iteration)
+
+    return iteration
 
 def run_episode(
     attacker_agent: EvaluationAgent,

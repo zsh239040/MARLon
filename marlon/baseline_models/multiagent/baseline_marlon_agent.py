@@ -177,10 +177,11 @@ class BaselineMarlonAgent(MarlonAgent):
     def train(self):
         self.baseline_model.train()
 
-    def learn(self, total_timesteps: int, n_eval_episodes: int):
+    def learn(self, total_timesteps: int, n_eval_episodes: int, callback=None):
         self.baseline_model.learn(
             total_timesteps=total_timesteps,
-            n_eval_episodes=n_eval_episodes
+            n_eval_episodes=n_eval_episodes,
+            callback=callback
         )
 
     def setup_learn(self,

@@ -1,12 +1,13 @@
 from abc import ABC, abstractmethod
 import logging
 import os
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import numpy as np
 import gym
 
 from stable_baselines3.common.type_aliases import GymEnv
+from stable_baselines3.common.callbacks import BaseCallback
 
 from cyberbattle._env.cyberbattle_env import DefenderConstraint
 from marlon.baseline_models.env_wrappers.environment_event_source import EnvironmentEventSource
@@ -16,6 +17,29 @@ from marlon.baseline_models.env_wrappers.defend_wrapper import DefenderEnvWrappe
 from marlon.baseline_models.multiagent.evaluation_stats import EvalutionStats
 from marlon.baseline_models.multiagent.marlon_agent import MarlonAgent
 from marlon.baseline_models.multiagent import marl_algorithm
+
+
+class RolloutIterationCallback(BaseCallback):
+    """Runs a callback every N rollouts (iterations) and once more at the end."""
+
+    def __init__(self, interval: int, on_checkpoint: Callable[[int], None]):
+        super().__init__(verbose=0)
+        self.interval = interval
+        self.on_checkpoint = on_checkpoint
+        self.iteration = 0
+        self.last_saved: Optional[int] = None
+
+    def _on_rollout_end(self) -> bool:
+        self.iteration += 1
+        if self.interval > 0 and self.iteration % self.interval == 0:
+            self.on_checkpoint(self.iteration)
+            self.last_saved = self.iteration
+        return True
+
+    def _on_training_end(self) -> None:
+        if self.on_checkpoint and self.last_saved != self.iteration:
+            self.on_checkpoint(self.iteration)
+        return None
 
 
 class AgentBuilder(ABC):
@@ -148,7 +172,13 @@ class MultiAgentUniverse:
         self.max_timesteps = max_timesteps
         self.logger = logger
 
-    def learn(self, total_timesteps: int, n_eval_episodes: int):
+    def learn(
+        self,
+        total_timesteps: int,
+        n_eval_episodes: int,
+        checkpoint_interval: int = 0,
+        checkpoint_callback: Optional[Callable[[int], None]] = None,
+    ):
         '''
         Train all agents in the universe for the specified amount of steps or episodes,
         which ever comes first.
@@ -162,19 +192,30 @@ class MultiAgentUniverse:
         '''
 
         self.logger.info('Training started')
+        iterations: Optional[int] = None
         if self.defender_agent:
-            marl_algorithm.learn(
+            iterations = marl_algorithm.learn(
                 attacker_agent=self.attacker_agent,
                 defender_agent=self.defender_agent,
                 total_timesteps=total_timesteps,
-                n_eval_episodes=n_eval_episodes
+                n_eval_episodes=n_eval_episodes,
+                checkpoint_callback=checkpoint_callback,
+                checkpoint_interval=checkpoint_interval,
             )
         else:
+            callback: Optional[BaseCallback] = None
+            if checkpoint_callback and checkpoint_interval > 0:
+                callback = RolloutIterationCallback(checkpoint_interval, checkpoint_callback)
             self.attacker_agent.learn(
                 total_timesteps=total_timesteps,
-                n_eval_episodes=n_eval_episodes
+                n_eval_episodes=n_eval_episodes,
+                callback=callback
             )
+            if callback:
+                iterations = callback.iteration
+
         self.logger.info('Training complete')
+        return iterations
 
     def evaluate(self, n_episodes: int) -> EvalutionStats:
         '''

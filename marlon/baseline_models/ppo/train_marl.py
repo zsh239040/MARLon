@@ -1,50 +1,101 @@
+import shutil
+from pathlib import Path
+from typing import Optional, Union
+
 from stable_baselines3 import PPO
 
 from marlon.baseline_models.multiagent.baseline_marlon_agent import BaselineAgentBuilder
 from marlon.baseline_models.multiagent.multiagent_universe import MultiAgentUniverse
+from marlon.baseline_models.ppo.logging_utils import CheckpointManager, log_run
 
 ENV_MAX_TIMESTEPS = 1500
 LEARN_TIMESTEPS = 300_000
-LEARN_EPISODES = 10000 # Set this to a large value to stop at LEARN_TIMESTEPS instead.
+LEARN_EPISODES = 10000  # Set this to a large value to stop at LEARN_TIMESTEPS instead.
 ATTACKER_INVALID_ACTION_REWARD_MODIFIER = 0
 ATTACKER_INVALID_ACTION_REWARD_MULTIPLIER = 0
-DEFENDER_INVALID_ACTION_REWARD = -1
+DEFENDER_INVALID_ACTION_REWARD = 0
 DEFENDER_RESET_ON_CONSTRAINT_BROKEN = False
 EVALUATE_EPISODES = 5
-ATTACKER_SAVE_PATH = 'ppo_marl_attacker.zip'
-DEFENDER_SAVE_PATH = 'ppo_marl_defender.zip'
+ATTACKER_MODEL_FILENAME = "ppo_marl_attacker.zip"
+DEFENDER_MODEL_FILENAME = "ppo_marl_defender.zip"
+RUN_NAME = "ppo_marl"
+CHECKPOINT_INTERVAL = 10
+CHECKPOINT_KEEP = 5
+CHECKPOINTS_SUBDIR = "checkpoints"
+ATTACKER_CKPT_PREFIX = "attacker"
+DEFENDER_CKPT_PREFIX = "defender"
 
-def train(evaluate_after=False):
-    universe = MultiAgentUniverse.build(
-        env_id='CyberBattleToyCtf-v0',
-        attacker_builder=BaselineAgentBuilder(
-            alg_type=PPO,
-            policy='MultiInputPolicy'
-        ),
-        defender_builder=BaselineAgentBuilder(
-            alg_type=PPO,
-            policy='MultiInputPolicy'
-        ),
-        attacker_invalid_action_reward_modifier=ATTACKER_INVALID_ACTION_REWARD_MODIFIER,
-        attacker_invalid_action_reward_multiplier=ATTACKER_INVALID_ACTION_REWARD_MULTIPLIER,
-        defender_invalid_action_reward_modifier=DEFENDER_INVALID_ACTION_REWARD,
-        defender_reset_on_constraint_broken=DEFENDER_RESET_ON_CONSTRAINT_BROKEN,
-    )
 
-    universe.learn(
-        total_timesteps=LEARN_TIMESTEPS,
-        n_eval_episodes=LEARN_EPISODES
-    )
+RunDir = Union[Path, str]
 
-    universe.save(
-        attacker_filepath=ATTACKER_SAVE_PATH,
-        defender_filepath=DEFENDER_SAVE_PATH
-    )
 
-    if evaluate_after:
-        universe.evaluate(
-            n_episodes=EVALUATE_EPISODES
+def train(evaluate_after: bool = False, run_dir: Optional[RunDir] = None, also_print: bool = True) -> Path:
+    hyperparams = {
+        "env_max_timesteps": ENV_MAX_TIMESTEPS,
+        "learn_timesteps": LEARN_TIMESTEPS,
+        "learn_episodes": LEARN_EPISODES,
+        "attacker_invalid_action_reward_modifier": ATTACKER_INVALID_ACTION_REWARD_MODIFIER,
+        "attacker_invalid_action_reward_multiplier": ATTACKER_INVALID_ACTION_REWARD_MULTIPLIER,
+        "defender_invalid_action_reward": DEFENDER_INVALID_ACTION_REWARD,
+        "defender_reset_on_constraint_broken": DEFENDER_RESET_ON_CONSTRAINT_BROKEN,
+        "evaluate_episodes": EVALUATE_EPISODES,
+    }
+
+    with log_run(RUN_NAME, "train", hyperparams, run_dir=run_dir, also_print=also_print) as (run_path, _):
+        attacker_save_path = run_path / ATTACKER_MODEL_FILENAME
+        defender_save_path = run_path / DEFENDER_MODEL_FILENAME
+        checkpoint_root = run_path / CHECKPOINTS_SUBDIR
+        attacker_checkpoints = CheckpointManager(checkpoint_root / "attacker", ATTACKER_CKPT_PREFIX, keep=CHECKPOINT_KEEP)
+        defender_checkpoints = CheckpointManager(checkpoint_root / "defender", DEFENDER_CKPT_PREFIX, keep=CHECKPOINT_KEEP)
+        print(f"Training PPO attacker and defender. Run directory: {run_path}")
+
+        universe = MultiAgentUniverse.build(
+            env_id="CyberBattleToyCtf-v0",
+            attacker_builder=BaselineAgentBuilder(
+                alg_type=PPO,
+                policy="MultiInputPolicy",
+            ),
+            defender_builder=BaselineAgentBuilder(
+                alg_type=PPO,
+                policy="MultiInputPolicy",
+            ),
+            attacker_invalid_action_reward_modifier=ATTACKER_INVALID_ACTION_REWARD_MODIFIER,
+            attacker_invalid_action_reward_multiplier=ATTACKER_INVALID_ACTION_REWARD_MULTIPLIER,
+            defender_invalid_action_reward_modifier=DEFENDER_INVALID_ACTION_REWARD,
+            defender_reset_on_constraint_broken=DEFENDER_RESET_ON_CONSTRAINT_BROKEN,
         )
 
-if __name__ == '__main__':
-    train(evaluate_after=True)
+        def checkpoint_saver(iteration: int):
+            attacker_checkpoints.save(iteration, lambda path: universe.attacker_agent.save(str(path)))
+            defender_checkpoints.save(iteration, lambda path: universe.defender_agent.save(str(path)))
+
+        universe.learn(
+            total_timesteps=LEARN_TIMESTEPS,
+            n_eval_episodes=LEARN_EPISODES,
+            checkpoint_interval=CHECKPOINT_INTERVAL,
+            checkpoint_callback=checkpoint_saver,
+        )
+
+        universe.save(
+            attacker_filepath=str(attacker_save_path),
+            defender_filepath=str(defender_save_path),
+        )
+        latest_attacker = attacker_checkpoints.latest()
+        latest_defender = defender_checkpoints.latest()
+        if latest_attacker:
+            shutil.copy2(latest_attacker, attacker_save_path)
+        if latest_defender:
+            shutil.copy2(latest_defender, defender_save_path)
+        print(f"Saved attacker model to {attacker_save_path}")
+        print(f"Saved defender model to {defender_save_path}")
+
+        if evaluate_after:
+            from marlon.baseline_models.ppo import eval_marl
+
+            eval_marl.evaluate(run_dir=run_path, also_print=also_print)
+
+        return run_path
+
+
+if __name__ == "__main__":
+    train(evaluate_after=True, also_print=False)
