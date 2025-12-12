@@ -142,6 +142,10 @@ def _make_env_instance(strategy: str, seed: int) -> EnvInstance:
 
     rng = np.random.default_rng(seed + 3)
 
+    # Initialize wrappers for random-only env stepping (sets timesteps, buffers, etc.).
+    # SB3-managed envs will be reset again by VecEnv, so this is safe.
+    attacker_wrapper.reset(seed=seed)
+
     return EnvInstance(
         strategy=strategy,
         seed=seed,

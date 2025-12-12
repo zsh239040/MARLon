@@ -5,3 +5,4 @@ __pycache__/
 *.xlsx
 *.log
 src/loonshot-sim
+src/marlon.tar.gz

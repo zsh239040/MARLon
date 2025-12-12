@@ -57,6 +57,9 @@ def sample_safe_defender_action(defender_wrapper, rng: np.random.Generator, max_
 
 
 def _step_random_attacker(attacker_wrapper, rng: np.random.Generator):
+    # Random-only envs are not managed by SB3, so ensure they are initialized.
+    if getattr(attacker_wrapper, "timesteps", None) is None:
+        attacker_wrapper.reset()
     action = attacker_wrapper.action_space.sample()
     obs, reward, terminated, truncated, info = attacker_wrapper.step(action)
     done = bool(terminated or truncated)
