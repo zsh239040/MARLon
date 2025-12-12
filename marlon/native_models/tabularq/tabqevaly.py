@@ -1,7 +1,7 @@
 import sys
 import logging
 import torch
-import gym
+import gymnasium as gym
 import cyberbattle.agents.baseline.learner as learner
 import cyberbattle.agents.baseline.agent_wrapper as w
 from cyberbattle.agents.baseline.agent_wrapper import Verbosity

@@ -75,7 +75,12 @@ class RandomMarlonAgent(MarlonAgent):
     def perform_step(self, n_steps: int) -> Tuple[bool, Any, Any]:
         # Choose a random action and perform the step.
         action = self.env.action_space.sample()
-        _observation, _reward, done, _info = self.env.step(action)
+        step_result = self.env.step(action)
+        if len(step_result) == 5:
+            _observation, _reward, terminated, truncated, _info = step_result
+            done = terminated or truncated
+        else:
+            _observation, _reward, done, _info = step_result
 
         # First value is whether to continue, this is normally determined by a callback
         # which we don't have, so we'll rely on the done flag.

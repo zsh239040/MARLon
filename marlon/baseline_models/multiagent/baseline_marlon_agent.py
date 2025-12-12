@@ -6,7 +6,7 @@ import numpy as np
 from stable_baselines3 import A2C
 import torch as th
 
-import gym
+import gymnasium as gym
 
 from stable_baselines3.common.utils import safe_mean, obs_as_tensor
 from stable_baselines3.common.buffers import RolloutBuffer
@@ -106,7 +106,12 @@ class BaselineMarlonAgent(MarlonAgent):
                 self.baseline_model.action_space.high
             )
 
-        new_obs, rewards, dones, infos = self.env.step(clipped_actions)
+        step_result = self.env.step(clipped_actions)
+        if len(step_result) == 5:
+            new_obs, rewards, terminated, truncated, infos = step_result
+            dones = np.array([terminated or truncated]) if not isinstance(terminated, np.ndarray) else np.logical_or(terminated, truncated)
+        else:
+            new_obs, rewards, dones, infos = step_result
 
         self.baseline_model.num_timesteps += self.env.num_envs
 
@@ -178,9 +183,9 @@ class BaselineMarlonAgent(MarlonAgent):
         self.baseline_model.train()
 
     def learn(self, total_timesteps: int, n_eval_episodes: int, callback=None):
+        """Single-agent learn wrapper; SB3 2.3.x does not take n_eval_episodes here."""
         self.baseline_model.learn(
             total_timesteps=total_timesteps,
-            n_eval_episodes=n_eval_episodes,
             callback=callback
         )
 
@@ -193,19 +198,32 @@ class BaselineMarlonAgent(MarlonAgent):
         reset_num_timesteps: bool,
         tb_log_name: str) -> Tuple[int, BaseCallback]:
 
+        # Wire optional evaluation callback manually (SB3 _setup_learn no longer takes eval_* args)
+        callback: Optional[BaseCallback] = None
+        if eval_env is not None and eval_freq > 0:
+            from stable_baselines3.common.callbacks import EvalCallback
+            callback = EvalCallback(
+                eval_env,
+                n_eval_episodes=n_eval_episodes,
+                eval_freq=eval_freq,
+                log_path=eval_log_path,
+                warn=False,
+            )
+
         total_timesteps, callback = self.baseline_model._setup_learn(
             total_timesteps=total_timesteps,
-            eval_env=eval_env,
-            callback=None,
-            eval_freq=eval_freq,
-            n_eval_episodes=n_eval_episodes,
-            log_path=eval_log_path,
+            callback=callback,
             reset_num_timesteps=reset_num_timesteps,
-            tb_log_name=tb_log_name
+            tb_log_name=tb_log_name,
+            progress_bar=False
         )
 
+        # Align with SB3's learn() bookkeeping
+        self.baseline_model.start_time = time.time()
+
         self.callback = callback
-        self.callback.on_training_start(locals(), globals())
+        if self.callback:
+            self.callback.on_training_start(locals(), globals())
 
         return total_timesteps
 

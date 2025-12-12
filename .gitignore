@@ -3,5 +3,5 @@ __pycache__/
 *.zip
 *.csv
 *.xlsx
-src/loonshot-sim
 *.log
+src/loonshot-sim

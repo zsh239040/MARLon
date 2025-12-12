@@ -1,7 +1,7 @@
 import sys
 import logging
 import torch
-import gym
+import gymnasium as gym
 from cyberbattle.agents.baseline import learner
 import cyberbattle.agents.baseline.agent_wrapper as w
 import cyberbattle.agents.baseline.agent_tabularqlearning as tabularq

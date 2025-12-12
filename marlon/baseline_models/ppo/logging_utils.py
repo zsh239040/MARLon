@@ -153,6 +153,12 @@ def log_run(
 
         try:
             yield run_path, log_path
+        except Exception:
+            import traceback
+            log_file.write("\n--- EXCEPTION ---\n")
+            traceback.print_exc(file=log_file)
+            log_file.flush()
+            raise
         finally:
             sys.stdout = stdout_orig
             sys.stderr = stderr_orig

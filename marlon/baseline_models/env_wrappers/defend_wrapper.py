@@ -6,9 +6,9 @@ import numpy as np
 
 from plotly.missing_ipywidgets import FigureWidget
 
-import gym
-from gym import spaces
-from gym.spaces.space import Space
+import gymnasium as gym
+from gymnasium import spaces
+from gymnasium.spaces.space import Space
 
 from cyberbattle.simulation import model
 from cyberbattle._env.cyberbattle_env import CyberBattleEnv, EnvironmentBounds, Observation
@@ -37,12 +37,18 @@ class DefenderEnvWrapper(gym.Env, IEnvironmentObserver):
         defender: bool = False,
         max_timesteps=100,
         invalid_action_reward=0,
-        reset_on_constraint_broken = True):
+        reset_on_constraint_broken = True,
+        loss_reward: float = -5000.0,
+        sla_deficit_penalty_scale: float = 50.0,
+        sla_worsening_penalty_scale: float = 200.0):
 
         super().__init__()
         self.defender = None
         self.cyber_env: CyberBattleEnv = cyber_env
-        self.bounds: EnvironmentBounds = self.cyber_env._bounds
+        self._base_env = cyber_env.unwrapped
+        self._actuator = self._base_env._defender_actuator  # noqa: SLF001
+        self._defender_constraint = self._base_env._CyberBattleEnv__defender_constraint  # noqa: SLF001
+        self.bounds: EnvironmentBounds = self.cyber_env.bounds
         self.num_services = 0
         self.observation_space: Space = self.__create_observation_space(cyber_env)
         self.action_space: Space = self.__create_defender_action_space(cyber_env)
@@ -56,6 +62,13 @@ class DefenderEnvWrapper(gym.Env, IEnvironmentObserver):
         self.first = True
         self.reset_request = False
         self.invalid_action_penalty = invalid_action_reward
+        self.loss_reward = loss_reward
+        # SLA shaping parameters. loss_reward is treated as a one-time penalty
+        # when SLA is first broken; subsequent penalties are scaled by deficit/trend.
+        self.sla_deficit_penalty_scale = sla_deficit_penalty_scale
+        self.sla_worsening_penalty_scale = sla_worsening_penalty_scale
+        self._has_breached_sla = False
+        self._prev_network_availability = float(self._actuator.network_availability)
         # Add this object as an observer of the cyber env.
         if event_source is None:
             event_source = EnvironmentEventSource()
@@ -66,6 +79,9 @@ class DefenderEnvWrapper(gym.Env, IEnvironmentObserver):
         self.defender: LearningDefender = LearningDefender(cyber_env)
         self.__last_attacker_reward = None
         self.reset_on_constraint_broken = reset_on_constraint_broken
+        # Track last episode counts to survive VecEnv auto-reset
+        self.last_valid_action_count = 0
+        self.last_invalid_action_count = 0
 
     def __create_observation_space(self, cyber_env: CyberBattleEnv) -> gym.Space:
         """Creates a compatible version of the attackers observation space."""
@@ -102,8 +118,9 @@ class DefenderEnvWrapper(gym.Env, IEnvironmentObserver):
         logging.info(f"Action space defender = {action_space}")
         return spaces.MultiDiscrete(action_space)
 
-    def step(self, action) -> Tuple[Observation, float, bool, Dict[str, Any]]:
-        done = False
+    def step(self, action) -> Tuple[Observation, float, bool, bool, Dict[str, Any]]:
+        terminated = False
+        truncated = False
         reward = 0
         # Check for action validity
         if not self.is_defender_action_valid(action):
@@ -116,31 +133,50 @@ class DefenderEnvWrapper(gym.Env, IEnvironmentObserver):
             self.valid_action_count += 1
         
         self.defender.executeAction(action)
+        current_availability = float(self._actuator.network_availability)
+        sla_threshold = float(self._defender_constraint.maintain_sla)
         # Take the reward gained this step from the attacker's step and invert it so the defender
         # loses more reward if the attacker succeeds.
         if self.attacker_reward_store.episode_rewards:
             reward += -1*self.attacker_reward_store.episode_rewards[-1]
 
-        if self.defender_constraints_broken():
-            reward = self.cyber_env._CyberBattleEnv__LOSING_REWARD
-            logging.warning("Defender Lost")
-            if self.reset_on_constraint_broken:
-                done = True
-        if self.cyber_env._CyberBattleEnv__defender_goal_reached():
-            reward = self.cyber_env._CyberBattleEnv__WINNING_REWARD
-            done = True
+        if current_availability < sla_threshold:
+            # One-time penalty on first breach to avoid exploding reward scales.
+            if not self._has_breached_sla:
+                reward += self.loss_reward
+                logging.warning("Defender Lost")
+                if self.reset_on_constraint_broken:
+                    terminated = True
+                self._has_breached_sla = True
+
+            deficit = sla_threshold - current_availability
+            if deficit > 0:
+                reward -= self.sla_deficit_penalty_scale * deficit
+
+            worsening = self._prev_network_availability - current_availability
+            if worsening > 0:
+                reward -= self.sla_worsening_penalty_scale * worsening
+        else:
+            # Reset breach state when SLA recovered so future breaches are penalized again.
+            self._has_breached_sla = False
+
+        self._prev_network_availability = current_availability
+        if self._base_env._CyberBattleEnv__defender_goal_reached():  # noqa: SLF001
+            reward = self._base_env._CyberBattleEnv__WINNING_REWARD  # noqa: SLF001
+            terminated = True
         # Generate the new defender observation based on the defender's action
         defender_observation = self.observe()
         self.timesteps += 1
 
         if self.reset_request:
-            done = True
+            truncated = True
             reward = -1*self.__last_attacker_reward
-        elif self.timesteps > self.max_timesteps:
-            done = True
+        elif self.timesteps >= self.max_timesteps:
+            truncated = True
 
         self.rewards.append(reward)
-        return defender_observation, reward, done, {}
+        done = terminated or truncated
+        return defender_observation, reward, terminated, truncated, {}
 
     def is_defender_action_valid(self, action) -> boolean:
         """Determines if a given action is valid within the environment."""
@@ -153,7 +189,7 @@ class DefenderEnvWrapper(gym.Env, IEnvironmentObserver):
 
         def get_node_from_action(node_from_action: int):
             """Gets the node id from an action"""
-            return list(self.cyber_env.environment.network.nodes)[node_from_action]
+            return list(self._base_env.environment.network.nodes)[node_from_action]
 
         def get_node_info(node_id: model.NodeID):
             """Given a node ID, find the corresponding node info"""
@@ -227,21 +263,30 @@ class DefenderEnvWrapper(gym.Env, IEnvironmentObserver):
         else:
             return False
 
-    def reset(self) -> Observation:
+    def reset(self, *, seed=None, options=None) -> Tuple[Observation, Dict[str, Any]]:
         logging.debug('Reset Defender')
         if not self.reset_request:
             self.event_source.notify_reset(last_reward=0)
 
-        self.cyber_env.reset()
+        reset_result = self.cyber_env.reset(seed=seed, options=options)
+        if isinstance(reset_result, tuple) and len(reset_result) == 2:
+            _, info = reset_result
+        else:
+            info = {}
 
         self.reset_request = False
         self.__last_attacker_reward = None
         self.rewards = []
         self.timesteps = 0
+        # Preserve counts from the episode that just ended (VecEnv resets automatically on done)
+        self.last_valid_action_count = self.valid_action_count
+        self.last_invalid_action_count = self.invalid_action_count
         self.valid_action_count = 0
         self.invalid_action_count = 0
+        self._has_breached_sla = False
+        self._prev_network_availability = float(self._actuator.network_availability)
 
-        return self.observe()
+        return self.observe(), info
 
     def on_reset(self, last_reward):
         logging.debug('on_reset Defender')
@@ -304,7 +349,7 @@ class DefenderEnvWrapper(gym.Env, IEnvironmentObserver):
         self.reset_request = reset_request
 
     def defender_constraints_broken(self):
-        return self.cyber_env._defender_actuator.network_availability < self.cyber_env._CyberBattleEnv__defender_constraint.maintain_sla
+        return self._actuator.network_availability < self._defender_constraint.maintain_sla
 
     def close(self) -> None:
         return self.cyber_env.close()

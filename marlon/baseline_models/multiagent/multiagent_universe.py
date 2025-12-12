@@ -4,7 +4,7 @@ import os
 from typing import Callable, List, Optional
 
 import numpy as np
-import gym
+import gymnasium as gym
 
 from stable_baselines3.common.type_aliases import GymEnv
 from stable_baselines3.common.callbacks import BaseCallback
@@ -150,7 +150,8 @@ class MultiAgentUniverse:
                 max_timesteps=max_timesteps,
                 invalid_action_reward=defender_invalid_action_reward_modifier,
                 defender=True,
-                reset_on_constraint_broken=defender_reset_on_constraint_broken
+                reset_on_constraint_broken=defender_reset_on_constraint_broken,
+                loss_reward=defender_loss_reward
             )
             defender_agent = defender_builder.build(defender_wrapper, logger)
 
@@ -251,16 +252,22 @@ class MultiAgentUniverse:
                 max_steps=self.max_timesteps
             )
 
+            # VecEnv auto-reset wipes counters; keep the last-episode snapshot if present.
+            attacker_valid = getattr(self.attacker_agent.wrapper, "last_valid_action_count", self.attacker_agent.wrapper.valid_action_count)
+            attacker_invalid = getattr(self.attacker_agent.wrapper, "last_invalid_action_count", self.attacker_agent.wrapper.invalid_action_count)
+
             attacker_rewards.append(sum(episode_rewards1))
-            attacker_valid_actions.append(self.attacker_agent.wrapper.valid_action_count)
-            attacker_invalid_actions.append(self.attacker_agent.wrapper.invalid_action_count)
+            attacker_valid_actions.append(attacker_valid)
+            attacker_invalid_actions.append(attacker_invalid)
 
             episode_steps.append(len(episode_rewards1))
 
             if self.defender_agent:
                 defender_rewards.append(sum(episode_rewards2))
-                defender_valid_actions.append(self.defender_agent.wrapper.valid_action_count)
-                defender_invalid_actions.append(self.defender_agent.wrapper.invalid_action_count)
+                defender_valid = getattr(self.defender_agent.wrapper, "last_valid_action_count", self.defender_agent.wrapper.valid_action_count)
+                defender_invalid = getattr(self.defender_agent.wrapper, "last_invalid_action_count", self.defender_agent.wrapper.invalid_action_count)
+                defender_valid_actions.append(defender_valid)
+                defender_invalid_actions.append(defender_invalid)
 
         stats = EvalutionStats(
             episode_steps=episode_steps,

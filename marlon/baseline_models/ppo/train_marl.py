@@ -8,7 +8,7 @@ from marlon.baseline_models.multiagent.baseline_marlon_agent import BaselineAgen
 from marlon.baseline_models.multiagent.multiagent_universe import MultiAgentUniverse
 from marlon.baseline_models.ppo.logging_utils import CheckpointManager, log_run
 
-ENV_MAX_TIMESTEPS = 1500
+ENV_MAX_TIMESTEPS = 2000
 LEARN_TIMESTEPS = 300_000
 LEARN_EPISODES = 10000  # Set this to a large value to stop at LEARN_TIMESTEPS instead.
 ATTACKER_INVALID_ACTION_REWARD_MODIFIER = 0
@@ -63,6 +63,7 @@ def train(evaluate_after: bool = False, run_dir: Optional[RunDir] = None, also_p
             attacker_invalid_action_reward_multiplier=ATTACKER_INVALID_ACTION_REWARD_MULTIPLIER,
             defender_invalid_action_reward_modifier=DEFENDER_INVALID_ACTION_REWARD,
             defender_reset_on_constraint_broken=DEFENDER_RESET_ON_CONSTRAINT_BROKEN,
+            max_timesteps=ENV_MAX_TIMESTEPS,
         )
 
         def checkpoint_saver(iteration: int):

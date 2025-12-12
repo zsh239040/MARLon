@@ -1,0 +1,19 @@
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - wiblum/*
+env:
+  containerRegistry: spinshot.azurecr.io
+  imageRepository: cyberbattle
+  tag: ${{ github.sha }}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+
+      - run: |
+          docker build . -t  ${{ env.containerRegistry }}/${{ env.imageRepository }}:${{ env.tag }}

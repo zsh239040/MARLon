@@ -171,11 +171,13 @@ def run_episode(
     simulation: Dict[str, List[any]]
         None if is_simulation = False. A dictionary with 'attacker' and 'defender' simulation lists.
     '''
-    obs1 = attacker_agent.env.reset()
+    reset_result = attacker_agent.env.reset()
+    obs1 = reset_result[0] if isinstance(reset_result, tuple) else reset_result
 
     if defender_agent:
         defender_agent.wrapper.on_reset(0)
-        obs2 = defender_agent.env.reset()
+        reset_result_def = defender_agent.env.reset()
+        obs2 = reset_result_def[0] if isinstance(reset_result_def, tuple) else reset_result_def
 
     attacker_rewards = []
     defender_rewards = []
@@ -194,7 +196,12 @@ def run_episode(
 
     while n_steps < max_steps:
         action1 = attacker_agent.predict(observation=obs1)
-        obs1, rewards1, dones1, info1 = attacker_agent.env.step(action1)
+        step_result1 = attacker_agent.env.step(action1)
+        if len(step_result1) == 5:
+            obs1, rewards1, terminated1, truncated1, info1 = step_result1
+            dones1 = terminated1 or truncated1
+        else:
+            obs1, rewards1, dones1, info1 = step_result1
         if isinstance(rewards1, np.ndarray):
             rewards1 = rewards1[0]
 
@@ -213,7 +220,12 @@ def run_episode(
                 simulation.append(generate_graph_json(cyber_env, n_steps+1, sum(attacker_rewards), sum(defender_rewards)))
         else:
             action2 = defender_agent.predict(observation=obs2)
-            obs2, rewards2, dones2, info2 = defender_agent.env.step(action2)
+            step_result2 = defender_agent.env.step(action2)
+            if len(step_result2) == 5:
+                obs2, rewards2, terminated2, truncated2, info2 = step_result2
+                dones2 = terminated2 or truncated2
+            else:
+                obs2, rewards2, dones2, info2 = step_result2
             if isinstance(rewards2, np.ndarray):
                 rewards2 = rewards2[0]
 

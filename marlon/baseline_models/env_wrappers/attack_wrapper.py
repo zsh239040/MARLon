@@ -7,9 +7,9 @@ from plotly.missing_ipywidgets import FigureWidget
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-import gym
-from gym import spaces
-from gym.spaces.space import Space
+import gymnasium as gym
+from gymnasium import spaces
+from gymnasium.spaces.space import Space
 
 from cyberbattle._env.cyberbattle_env import Action, CyberBattleEnv, EnvironmentBounds, Observation
 from cyberbattle.simulation import commandcontrol, model
@@ -34,7 +34,7 @@ class AttackerEnvWrapper(gym.Env, IRewardStore, IEnvironmentObserver):
 
         super().__init__()
         self.cyber_env: CyberBattleEnv = cyber_env
-        self.bounds: EnvironmentBounds = self.cyber_env._bounds
+        self.bounds: EnvironmentBounds = self.cyber_env.bounds
         self.max_timesteps = max_timesteps
         self.invalid_action_reward_modifier = invalid_action_reward_modifier
         self.invalid_action_reward_multiplier = invalid_action_reward_multiplier
@@ -44,10 +44,18 @@ class AttackerEnvWrapper(gym.Env, IRewardStore, IEnvironmentObserver):
         self.timesteps = None
         self.cyber_rewards = [] # The rewards as given by CyberBattle, before modification.
         self.rewards = [] # The rewards returned by this wrapper, after modification.
+        # Track last episode counts so they survive VecEnv auto-reset
+        self.last_valid_action_count = 0
+        self.last_invalid_action_count = 0
 
-        # Access protected members only in the ctor to avoid pylint warnings.
-        self.node_count = cyber_env._CyberBattleEnv__node_count
-        self.__get_privilegelevel_array = cyber_env._CyberBattleEnv__get_privilegelevel_array
+        # Use maximum node count from bounds for shaping.
+        self.node_count = int(self.bounds.maximum_node_count)
+        # Cache flattened sizes to avoid recomputing each step
+        self._flat_local_len = self.node_count * int(self.bounds.local_attacks_count)
+        self._flat_remote_len = self.node_count * self.node_count * int(self.bounds.remote_attacks_count)
+        self._disc_props_len = int(self.bounds.maximum_node_count * self.bounds.property_count)
+        self._nodes_priv_len = int(self.bounds.maximum_node_count)
+        self._cred_cache_count = int(self.bounds.maximum_total_credentials)
 
         self.observation_space: Space = self.__create_observation_space(cyber_env)
         self.action_space: Space = self.__create_action_space(cyber_env)
@@ -74,18 +82,23 @@ class AttackerEnvWrapper(gym.Env, IRewardStore, IEnvironmentObserver):
         del observation_space['action_mask']
 
         # Change action_mask spaces to use node count instead of maximum node count.
-        observation_space['local_vulnerability'] = spaces.MultiBinary(self.node_count * self.bounds.local_attacks_count)
-        observation_space['remote_vulnerability'] = spaces.MultiBinary(self.node_count * self.node_count * self.bounds.remote_attacks_count)
+        observation_space['local_vulnerability'] = spaces.MultiBinary(self.node_count * int(self.bounds.local_attacks_count))
+        observation_space['remote_vulnerability'] = spaces.MultiBinary(self.node_count * self.node_count * int(self.bounds.remote_attacks_count))
 
         # Remove 'info' fields added by cyberbattle that do not represent algorithm inputs
-        del observation_space['credential_cache']
-        del observation_space['discovered_nodes']
-        del observation_space['explored_network']
+        for key in ['credential_cache', 'discovered_nodes', '_discovered_nodes', 'explored_network', '_explored_network']:
+            if key in observation_space:
+                del observation_space[key]
 
         # TODO: Reformat these spaces so they don't have to be removed
         # Remove nested Tuple/Dict spaces
         for space in self.nested_spaces + self.other_removed_spaces:
             del observation_space[space]
+
+        # Replace matrix-shaped MultiDiscrete with flattened version (SB3 expects 1-D nvec)
+        observation_space['discovered_nodes_properties'] = spaces.MultiDiscrete(
+            np.full(self.node_count * int(self.bounds.property_count), 3, dtype=int)
+        )
 
         # This is incorrectly set to spaces.MultiBinary(2)
         # It's a single value in the returned observations
@@ -122,7 +135,7 @@ class AttackerEnvWrapper(gym.Env, IRewardStore, IEnvironmentObserver):
     def __get_owned_nodes(self):
         return np.nonzero(self.__get_privilegelevel_array())[0]
 
-    def step(self, action: Action) -> Tuple[Observation, float, bool, Dict[str, Any]]:
+    def step(self, action: Action) -> Tuple[Observation, float, bool, bool, Dict[str, Any]]:
         # The first action value corresponds to the subspace
         action_subspace = self.action_subspaces[action[0]]
 
@@ -147,69 +160,38 @@ class AttackerEnvWrapper(gym.Env, IRewardStore, IEnvironmentObserver):
         # }
         # ```
 
-        # First, check if the action is valid.
+        # Validate action; if invalid, fall back to sampling a valid one.
         reward_modifier = 0
-        if not self.cyber_env.is_action_valid(translated_action):
-            # If it is not valid, we will try picking a random valid node and hoping
-            # that makes the action valid.
-
-            # Pick source node at random (owned and with the desired feature encoding)
-            potential_source_nodes = [
-                from_node
-                for from_node in self.__get_owned_nodes()
-                #if np.all(actor_features == self.node_specific_features.get(wrapped_env.state, from_node))
-            ]
-
-            if len(potential_source_nodes) > 0:
-                source_node = np.random.choice(potential_source_nodes)
-
-                if action_subspace[0] == 'local_vulnerability':
-                    # Replace node from the algorithm with a valid node.
-                    translated_action[action_subspace[0]][0] = source_node
-                else:
-                    # Target node can be any potential node excluding source node.
-                    potential_source_nodes.remove(source_node)
-
-                    if len(potential_source_nodes) > 0:
-                        target_node = np.random.choice(potential_source_nodes)
-
-                        # Replace source and target node from the algorithm with valid nodes.
-                        translated_action[action_subspace[0]][0] = source_node
-                        translated_action[action_subspace[0]][1] = target_node
-                    else:
-                        # No potential target nodes
-                        pass
-            else:
-                # No potential source nodes
-                pass
-
-        # If the action is still invalid, sample a random valid action.
-        # TODO: Try invalid action masks instead of sampling a random valid action; 'Dynamic action spaces'.
-        # https://sb3-contrib.readthedocs.io/en/master/modules/ppo_mask.html
         is_invalid = False
         if not self.cyber_env.is_action_valid(translated_action):
-            # sample local and remote actions only (excludes connect action)
             translated_action = self.cyber_env.sample_valid_action(kinds=[0, 1, 2])
             self.invalid_action_count += 1
-
             reward_modifier += self.invalid_action_reward_modifier
             is_invalid = True
         else:
             self.valid_action_count += 1
 
-        observation, reward, done, info = self.cyber_env.step(translated_action)
+        step_result = self.cyber_env.step(translated_action)
+        if len(step_result) == 5:
+            observation, reward, terminated, truncated, info = step_result
+            done = terminated or truncated
+        else:
+            observation, reward, done, info = step_result
+            terminated, truncated = done, False
         transformed_observation = self.transform_observation(observation)
         self.cyber_rewards.append(reward)
 
-        if done:
+        if done and not truncated:
             logging.warning("Attacker Won")
 
         self.timesteps += 1
         if self.reset_request:
-            done = True
+            truncated = True
 
         if self.timesteps > self.max_timesteps:
-            done = True
+            truncated = True
+
+        done = terminated or truncated
 
         # If action was invalid, multiplier is applied before reward modifier
         if is_invalid:
@@ -218,15 +200,24 @@ class AttackerEnvWrapper(gym.Env, IRewardStore, IEnvironmentObserver):
         reward += reward_modifier
         self.rewards.append(reward)
 
-        return transformed_observation, reward, done, info
+        return transformed_observation, reward, terminated, truncated, info
 
-    def reset(self) -> Observation:
+    def reset(self, *, seed=None, options=None) -> Tuple[Observation, Dict[str, Any]]:
         logging.debug('Reset Attacker')
         if not self.reset_request:
             last_reward = self.rewards[-1] if len(self.rewards) > 0 else 0
             self.event_source.notify_reset(last_reward)
 
-        observation = self.cyber_env.reset()
+        # Preserve counts from the episode that just ended (VecEnv resets automatically on done)
+        self.last_valid_action_count = self.valid_action_count
+        self.last_invalid_action_count = self.invalid_action_count
+
+        reset_result = self.cyber_env.reset(seed=seed, options=options)
+        if isinstance(reset_result, tuple) and len(reset_result) == 2:
+            observation, info = reset_result
+        else:
+            observation = reset_result
+            info = {}
 
         self.reset_request = False
         self.valid_action_count = 0
@@ -235,7 +226,7 @@ class AttackerEnvWrapper(gym.Env, IRewardStore, IEnvironmentObserver):
         self.cyber_rewards = []
         self.rewards = []
 
-        return self.transform_observation(observation)
+        return self.transform_observation(observation), info
 
     def on_reset(self, last_rewards):
         logging.info('on_reset Attacker')
@@ -249,42 +240,22 @@ class AttackerEnvWrapper(gym.Env, IRewardStore, IEnvironmentObserver):
         del observation['action_mask']
 
         # TODO: Retain real values
-        #if observation['credential_cache_matrix'].shape == (1,2):
-        credential_cache_matrix = []
-        for _ in range(self.bounds.maximum_total_credentials):
-            credential_cache_matrix.append(np.zeros((2,)))
+        observation['credential_cache_matrix'] = tuple(np.zeros((self._cred_cache_count, 2), dtype=np.float32))
+        observation['discovered_nodes_properties'] = np.zeros((self._disc_props_len,), dtype=np.float32)
+        observation['nodes_privilegelevel'] = np.zeros((self._nodes_priv_len,), dtype=np.float32)
 
-        # TODO: Clean this up a bit, action masks are not needed here
-        observation['credential_cache_matrix'] = tuple(credential_cache_matrix)
-        observation['discovered_nodes_properties'] = np.zeros((self.bounds.maximum_node_count * self.bounds.property_count,))
-        observation['nodes_privilegelevel'] = np.zeros((self.bounds.maximum_node_count,))
-
-        # Flatten action_mask subspaces
+        # Flatten action_mask subspaces using vectorized reshape
         # local_vulnerability comes in shape (node_count, local_attacks_count,)
         # but needs to be (node_count * local_attacks_count,)
-        local_vulnerability = np.zeros((self.node_count * self.bounds.local_attacks_count,))
-        flat_index = 0
-        for i in range(self.node_count):
-            for j in range(self.bounds.local_attacks_count):
-                local_vulnerability[flat_index] = observation['local_vulnerability'][i][j]
-                flat_index += 1
-        observation['local_vulnerability'] = local_vulnerability
+        observation['local_vulnerability'] = np.asarray(observation['local_vulnerability'], dtype=np.float32).reshape(self._flat_local_len)
 
         # remote_vulnerability comes in shape (node_count, node_count, remote_attacks_count,)
         # but needs to be (node_count * node_count * remote_attacks_count,)
-        remote_vulnerability = np.zeros((self.node_count * self.node_count * self.bounds.remote_attacks_count,))
-        flat_index = 0
-        for i in range(self.node_count):
-            for j in range(self.node_count):
-                for k in range(self.bounds.local_attacks_count):
-                    remote_vulnerability[flat_index] = observation['remote_vulnerability'][i][j][k]
-                    flat_index += 1
-        observation['remote_vulnerability'] = remote_vulnerability
+        observation['remote_vulnerability'] = np.asarray(observation['remote_vulnerability'], dtype=np.float32).reshape(self._flat_remote_len)
 
         # Remove 'info' fields added by cyberbattle that do not represent algorithm inputs
-        del observation['credential_cache']
-        del observation['discovered_nodes']
-        del observation['explored_network']
+        for key in ['credential_cache', 'discovered_nodes', '_discovered_nodes', 'explored_network', '_explored_network']:
+            observation.pop(key, None)
 
         # Stable baselines does not like numpy wrapped ints
         for space in self.int32_spaces:
