@@ -7,14 +7,19 @@ from stable_baselines3 import PPO
 from marlon.baseline_models.multiagent.baseline_marlon_agent import BaselineAgentBuilder
 from marlon.baseline_models.multiagent.multiagent_universe import MultiAgentUniverse
 from marlon.baseline_models.multiagent.random_marlon_agent import RandomAgentBuilder
-from marlon.baseline_models.ppo.logging_utils import CheckpointManager, log_run
+from marlon.baseline_models.ppo.logging_utils import CheckpointManager, log_run, suppress_noisy_gymnasium_warnings
 
-ENV_MAX_TIMESTEPS = 1500
+ENV_MAX_TIMESTEPS = 2048
+ENV_MAX_NODE_COUNT = 12
+ENV_MAX_TOTAL_CREDENTIALS = 10
 LEARN_TIMESTEPS = 300_000
 LEARN_EPISODES = 10000  # Set this to a large value to stop at LEARN_TIMESTEPS instead.
-ATTACKER_INVALID_ACTION_REWARD = -1
-DEFENDER_INVALID_ACTION_REWARD = -1
+ATTACKER_INVALID_ACTION_REWARD = 0
+DEFENDER_INVALID_ACTION_REWARD = 0
 DEFENDER_RESET_ON_CONSTRAINT_BROKEN = False
+
+USE_ACTION_MASKING = True
+
 EVALUATE_EPISODES = 5
 DEFENDER_MODEL_FILENAME = "ppo_defender.zip"
 RUN_NAME = "ppo_defender"
@@ -28,8 +33,12 @@ RunDir = Union[Path, str]
 
 
 def train(evaluate_after: bool = False, run_dir: Optional[RunDir] = None, also_print: bool = True) -> Path:
+    suppress_noisy_gymnasium_warnings()
     hyperparams = {
         "env_max_timesteps": ENV_MAX_TIMESTEPS,
+        "env_max_node_count": ENV_MAX_NODE_COUNT,
+        "env_max_total_credentials": ENV_MAX_TOTAL_CREDENTIALS,
+        "use_action_masking": USE_ACTION_MASKING,
         "learn_timesteps": LEARN_TIMESTEPS,
         "learn_episodes": LEARN_EPISODES,
         "attacker_invalid_action_reward": ATTACKER_INVALID_ACTION_REWARD,
@@ -45,6 +54,10 @@ def train(evaluate_after: bool = False, run_dir: Optional[RunDir] = None, also_p
         print(f"Training PPO defender. Run directory: {run_path}")
         universe = MultiAgentUniverse.build(
             env_id="CyberBattleToyCtf-v0",
+            max_timesteps=ENV_MAX_TIMESTEPS,
+            maximum_node_count=ENV_MAX_NODE_COUNT,
+            maximum_total_credentials=ENV_MAX_TOTAL_CREDENTIALS,
+            attacker_action_masking=USE_ACTION_MASKING,
             attacker_builder=RandomAgentBuilder(),
             defender_builder=BaselineAgentBuilder(
                 alg_type=PPO,

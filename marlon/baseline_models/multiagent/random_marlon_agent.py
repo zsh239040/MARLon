@@ -66,15 +66,45 @@ class RandomMarlonAgent(MarlonAgent):
         # This agent does not log, number is irrelevant.
         return 1
 
-    def predict(self, observation: np.ndarray) -> np.ndarray:
+    def _sample_action(self):
+        """
+        Sample an action at random.
+
+        If the wrapped env exposes action masks (sb3-contrib format), sample uniformly
+        from the currently-valid actions. This is important when the attacker env is
+        wrapped with `MaskedDiscreteAttackerWrapper`, otherwise the random agent will
+        mostly pick invalid actions and stall training/evaluation.
+        """
+        action_masks = None
+        try:
+            action_masks = getattr(self.wrapper, "action_masks", None)
+            if callable(action_masks):
+                action_masks = action_masks()
+            else:
+                action_masks = None
+        except Exception:
+            action_masks = None
+
+        if action_masks is not None:
+            mask = np.asarray(action_masks, dtype=bool).reshape(-1)
+            valid = np.flatnonzero(mask)
+            if valid.size > 0:
+                rng = getattr(self.env, "np_random", None)
+                if rng is None:
+                    return int(np.random.choice(valid))
+                return int(rng.choice(valid))
+
         return self.env.action_space.sample()
+
+    def predict(self, observation: np.ndarray) -> np.ndarray:
+        return self._sample_action()
 
     def post_predict_callback(self, observation, reward, done, info):
         pass
 
     def perform_step(self, n_steps: int) -> Tuple[bool, Any, Any]:
         # Choose a random action and perform the step.
-        action = self.env.action_space.sample()
+        action = self._sample_action()
         step_result = self.env.step(action)
         if len(step_result) == 5:
             _observation, _reward, terminated, truncated, _info = step_result
