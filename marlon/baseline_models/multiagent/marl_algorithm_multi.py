@@ -60,7 +60,15 @@ def _step_random_attacker(attacker_wrapper, rng: np.random.Generator):
     # Random-only envs are not managed by SB3, so ensure they are initialized.
     if getattr(attacker_wrapper, "timesteps", None) is None:
         attacker_wrapper.reset()
-    action = attacker_wrapper.action_space.sample()
+    if hasattr(attacker_wrapper, "action_masks"):
+        mask = np.asarray(attacker_wrapper.action_masks(), dtype=bool).reshape(-1)
+        valid = np.flatnonzero(mask)
+        if valid.size > 0:
+            action = int(rng.choice(valid))
+        else:
+            action = attacker_wrapper.action_space.sample()
+    else:
+        action = attacker_wrapper.action_space.sample()
     obs, reward, terminated, truncated, info = attacker_wrapper.step(action)
     done = bool(terminated or truncated)
     if done:
@@ -69,7 +77,9 @@ def _step_random_attacker(attacker_wrapper, rng: np.random.Generator):
 
 
 def _step_random_defender(defender_wrapper, rng: np.random.Generator):
-    action = sample_safe_defender_action(defender_wrapper, rng)
+    # Use an explicit no-op action: this avoids breaking SLA and makes the
+    # attacker-vs-random-defender env (strategy 'b') meaningfully easier.
+    action = []
     obs, reward, terminated, truncated, info = defender_wrapper.step(action)
     done = bool(terminated or truncated)
     if done:

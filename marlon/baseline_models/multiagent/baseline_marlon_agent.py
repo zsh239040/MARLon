@@ -1,6 +1,6 @@
 import logging
 import time
-from typing import Any, Optional, Tuple, Type
+from typing import Any, Dict, Optional, Tuple, Type
 
 import numpy as np
 from stable_baselines3 import A2C
@@ -21,14 +21,17 @@ from marlon.baseline_models.multiagent.multiagent_universe import AgentBuilder
 class BaselineAgentBuilder(AgentBuilder):
     '''Assists in creating BaselineMarlonAgents.'''
 
-    def __init__(self, alg_type: Type, policy: str):
+    def __init__(self, alg_type: Type, policy: str, model_kwargs: Optional[Dict[str, Any]] = None):
         assert issubclass(alg_type, OnPolicyAlgorithm), "Algorithm type must inherit OnPolicyAlgorithm."
 
         self.alg_type = alg_type
         self.policy = policy
+        self.model_kwargs = dict(model_kwargs or {})
 
     def build(self, wrapper: GymEnv, logger: logging.Logger) -> MarlonAgent:
-        model = self.alg_type(self.policy, Monitor(wrapper), verbose=1)
+        kwargs = dict(self.model_kwargs)
+        kwargs.setdefault("verbose", 1)
+        model = self.alg_type(self.policy, Monitor(wrapper), **kwargs)
         return BaselineMarlonAgent(model, wrapper, logger)
 
 class LoadFileBaselineAgentBuilder(AgentBuilder):
@@ -39,8 +42,9 @@ class LoadFileBaselineAgentBuilder(AgentBuilder):
         self.file_path = file_path
 
     def build(self, wrapper: GymEnv, logger: logging.Logger) -> MarlonAgent:
-        model = self.alg_type.load(self.file_path)
-        model.set_env(Monitor(wrapper))
+        # Load with an environment to allow changing the number of envs between training and evaluation.
+        # SB3 forbids set_env when env.num_envs != model.n_envs.
+        model = self.alg_type.load(self.file_path, env=Monitor(wrapper))
         return BaselineMarlonAgent(model, wrapper, logger)
 
 class BaselineMarlonAgent(MarlonAgent):
@@ -76,7 +80,18 @@ class BaselineMarlonAgent(MarlonAgent):
         return 100 if isinstance(self.baseline_model, A2C) else 1
 
     def predict(self, observation: np.ndarray) -> np.ndarray:
-        action, _ = self.baseline_model.predict(observation=observation)
+        action_masks = None
+        try:
+            from sb3_contrib.common.maskable.utils import get_action_masks
+
+            action_masks = get_action_masks(self.env)
+        except Exception:
+            action_masks = None
+
+        try:
+            action, _ = self.baseline_model.predict(observation=observation, action_masks=action_masks)
+        except TypeError:
+            action, _ = self.baseline_model.predict(observation=observation)
         return action
 
     def post_predict_callback(self, observation, reward, done, info):
@@ -89,10 +104,21 @@ class BaselineMarlonAgent(MarlonAgent):
             # Sample a new noise matrix
             self.baseline_model.policy.reset_noise(self.env.num_envs)
 
+        action_masks = None
+        try:
+            from sb3_contrib.common.maskable.utils import get_action_masks
+
+            action_masks = get_action_masks(self.env)
+        except Exception:
+            action_masks = None
+
         with th.no_grad():
             # Convert to pytorch tensor or to TensorDict
             obs_tensor = obs_as_tensor(self.baseline_model._last_obs, self.baseline_model.device)
-            actions, values, log_probs = self.baseline_model.policy.forward(obs_tensor)
+            try:
+                actions, values, log_probs = self.baseline_model.policy.forward(obs_tensor, action_masks=action_masks)
+            except TypeError:
+                actions, values, log_probs = self.baseline_model.policy.forward(obs_tensor)
 
         actions = actions.cpu().numpy()
 

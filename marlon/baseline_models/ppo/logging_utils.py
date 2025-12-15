@@ -2,7 +2,9 @@ import contextlib
 import datetime as _datetime
 import io
 import json
+import logging
 import sys
+import warnings
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Optional, Tuple, Union
 
@@ -145,9 +147,11 @@ def log_run(
 
         stdout_streams = [log_file]
         stderr_streams = [log_file]
+        # Use the real console streams when requested.
+        # This prevents nested log_run contexts from leaking output into the parent's log file.
         if also_print:
-            stdout_streams.append(stdout_orig)
-            stderr_streams.append(stderr_orig)
+            stdout_streams.append(sys.__stdout__)
+            stderr_streams.append(sys.__stderr__)
         sys.stdout = _Tee(stdout_streams)
         sys.stderr = _Tee(stderr_streams)
 
@@ -164,3 +168,86 @@ def log_run(
             sys.stderr = stderr_orig
             log_file.write("\n--- OUTPUT END ---\n")
             log_file.flush()
+
+
+def suppress_noisy_gymnasium_warnings() -> None:
+    # CyberBattleSim uses numpy.int32 for some Discrete fields; this is safe for SB3.
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*obs returned by the `reset\\(\\)` method should be an int or np\\.int64.*",
+        category=UserWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*obs returned by the `step\\(\\)` method should be an int or np\\.int64.*",
+        category=UserWarning,
+    )
+    # Deprecation warning from gymnasium wrapper attribute access (we avoid it, but keep quiet if upstream emits it)
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*env\\.bounds.*deprecated.*",
+        category=UserWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*env\\.environment.*deprecated.*",
+        category=UserWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*env\\.sample_valid_action.*deprecated.*",
+        category=UserWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*env\\.is_action_valid.*deprecated.*",
+        category=UserWarning,
+    )
+
+
+def get_stdout_logger(name: str, *, level: int = logging.INFO) -> logging.Logger:
+    """
+    Return a logger that prints once to the current sys.stdout.
+    Must be called from inside log_run() if you want output to land in the run log file.
+    """
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+    logger.propagate = False
+    handler_stream = sys.stdout
+
+    # Avoid accumulating handlers across repeated calls.
+    for h in list(logger.handlers):
+        if isinstance(h, logging.StreamHandler) and getattr(h, "stream", None) is handler_stream:
+            break
+    else:
+        logger.handlers = []
+        handler = logging.StreamHandler(handler_stream)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        logger.addHandler(handler)
+
+    return logger
+
+
+@contextlib.contextmanager
+def capture_cyberbattle_logs(*, level: int = logging.INFO):
+    """
+    Capture CyberBattleSim logs (e.g. BLOCKED TRAFFIC / discovered node / GOT REWARD)
+    into the current sys.stdout (which is redirected to eval.log by log_run()).
+    """
+    cyber_logger = logging.getLogger("cyberbattle")
+    old_level = cyber_logger.level
+    old_handlers = list(cyber_logger.handlers)
+    old_propagate = cyber_logger.propagate
+
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+
+    cyber_logger.handlers = [handler]
+    cyber_logger.setLevel(level)
+    cyber_logger.propagate = False
+    try:
+        yield
+    finally:
+        cyber_logger.handlers = old_handlers
+        cyber_logger.setLevel(old_level)
+        cyber_logger.propagate = old_propagate

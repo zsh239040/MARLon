@@ -23,11 +23,12 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
 from cyberbattle._env.cyberbattle_env import DefenderConstraint
 
 from marlon.baseline_models.env_wrappers.attack_wrapper import AttackerEnvWrapper
+from marlon.baseline_models.env_wrappers.action_masking import MaskedDiscreteAttackerWrapper
 from marlon.baseline_models.env_wrappers.defend_wrapper import DefenderEnvWrapper
 from marlon.baseline_models.env_wrappers.environment_event_source import EnvironmentEventSource
 from marlon.baseline_models.multiagent.baseline_marlon_agent import BaselineMarlonAgent
 from marlon.baseline_models.multiagent.marl_algorithm_multi import RandomEnvPair, learn_multi
-from marlon.baseline_models.ppo.logging_utils import CheckpointManager, log_run
+from marlon.baseline_models.ppo.logging_utils import CheckpointManager, log_run, suppress_noisy_gymnasium_warnings
 from marlon.baseline_models.ppo.train_marl import train as train_single
 
 
@@ -37,7 +38,7 @@ from marlon.baseline_models.ppo.train_marl import train as train_single
 
 ENV_ID = "CyberBattleToyCtf-v0"
 ENV_MAX_TIMESTEPS = 2000
-LEARN_TIMESTEPS_PER_ENV = 30_000
+LEARN_TIMESTEPS_PER_ENV = 300_000
 LEARN_EPISODES = 10_000  # Kept for parity; PPO stops on timesteps.
 
 # Multi-env setup
@@ -55,14 +56,16 @@ DEFENDER_INVALID_ACTION_REWARD = 0
 DEFENDER_RESET_ON_CONSTRAINT_BROKEN = False
 ATTACKER_LOSS_REWARD = -5000.0
 DEFENDER_LOSS_REWARD = -5000.0
+STATS_WINDOW_SIZE = 10
+USE_ACTION_MASKING = True
 
 # PPO hyperparams (shared unless overridden)
 ATTACKER_N_STEPS = 2048
 DEFENDER_N_STEPS = 2048
-BATCH_SIZE = 64
+BATCH_SIZE = 256
 N_EPOCHS = 10
-LEARNING_RATE_START = 3e-4
-LEARNING_RATE_MIN = 1e-5
+LEARNING_RATE_START = 5e-4
+LEARNING_RATE_MIN = 1e-4
 ANNEAL_ALPHA = 5.0  # Larger => faster decay
 
 # Logging/checkpointing
@@ -78,6 +81,17 @@ DEFENDER_CKPT_PREFIX = "defender"
 
 
 RunDir = Union[Path, str]
+
+
+def _make_cyber_env() -> gym.Env:
+    kwargs = dict(
+        defender_constraint=DefenderConstraint(maintain_sla=DEFENDER_MAINTAIN_SLA),
+        losing_reward=DEFENDER_LOSS_REWARD,
+    )
+    try:
+        return gym.make(ENV_ID, disable_env_checker=True, **kwargs)
+    except TypeError:
+        return gym.make(ENV_ID, **kwargs)
 
 
 def simulated_annealing_schedule(
@@ -103,54 +117,55 @@ class EnvInstance:
     strategy: str
     seed: int
     cyber_env: gym.Env
-    attacker_wrapper: AttackerEnvWrapper
+    attacker_wrapper: gym.Env
     defender_wrapper: DefenderEnvWrapper
     rng: np.random.Generator
 
 
 def _make_env_instance(strategy: str, seed: int) -> EnvInstance:
-    cyber_env = gym.make(
-        ENV_ID,
-        defender_constraint=DefenderConstraint(maintain_sla=DEFENDER_MAINTAIN_SLA),
-        losing_reward=DEFENDER_LOSS_REWARD,
-    )
-    cyber_env.reset(seed=seed)
+    cyber_env = _make_cyber_env()
 
     event_source = EnvironmentEventSource()
-    attacker_wrapper = AttackerEnvWrapper(
+    attacker_env: gym.Env = AttackerEnvWrapper(
         cyber_env=cyber_env,
         event_source=event_source,
         max_timesteps=ENV_MAX_TIMESTEPS,
         invalid_action_reward_modifier=ATTACKER_INVALID_ACTION_REWARD_MODIFIER,
         invalid_action_reward_multiplier=ATTACKER_INVALID_ACTION_REWARD_MULTIPLIER,
         loss_reward=ATTACKER_LOSS_REWARD,
+        log_episode_end=True,
+        episode_log_prefix=f"[strategy={strategy} seed={seed}]",
     )
+    if USE_ACTION_MASKING:
+        attacker_env = MaskedDiscreteAttackerWrapper(attacker_env)
     defender_wrapper = DefenderEnvWrapper(
         cyber_env=cyber_env,
-        attacker_reward_store=attacker_wrapper,
+        attacker_reward_store=attacker_env,
         event_source=event_source,
         max_timesteps=ENV_MAX_TIMESTEPS,
         invalid_action_reward=DEFENDER_INVALID_ACTION_REWARD,
         defender=True,
         reset_on_constraint_broken=DEFENDER_RESET_ON_CONSTRAINT_BROKEN,
         loss_reward=DEFENDER_LOSS_REWARD,
+        log_episode_end=True,
+        episode_log_prefix=f"[strategy={strategy} seed={seed}]",
     )
 
     # Ensure per-env random streams differ, even with same policies.
-    attacker_wrapper.action_space.seed(seed + 1)
+    attacker_env.action_space.seed(seed + 1)
     defender_wrapper.action_space.seed(seed + 2)
 
     rng = np.random.default_rng(seed + 3)
 
     # Initialize wrappers for random-only env stepping (sets timesteps, buffers, etc.).
     # SB3-managed envs will be reset again by VecEnv, so this is safe.
-    attacker_wrapper.reset(seed=seed)
+    attacker_env.reset(seed=seed)
 
     return EnvInstance(
         strategy=strategy,
         seed=seed,
         cyber_env=cyber_env,
-        attacker_wrapper=attacker_wrapper,
+        attacker_wrapper=attacker_env,  # type: ignore[assignment]
         defender_wrapper=defender_wrapper,
         rng=rng,
     )
@@ -173,6 +188,7 @@ def train(
     run_dir: Optional[RunDir] = None,
     also_print: bool = True,
 ) -> Path:
+    suppress_noisy_gymnasium_warnings()
     # Strategy list
     strategies: List[str] = (["a"] * N_ENVS_A) + (["b"] * N_ENVS_B) + (["c"] * N_ENVS_C)
     if len(strategies) != N_ENVS:
@@ -189,11 +205,18 @@ def train(
         "env_max_timesteps": ENV_MAX_TIMESTEPS,
         "learn_timesteps_per_env": LEARN_TIMESTEPS_PER_ENV,
         "learn_episodes": LEARN_EPISODES,
+        "stats_window_size": STATS_WINDOW_SIZE,
+        "use_action_masking": USE_ACTION_MASKING,
         "n_envs": N_ENVS,
         "n_envs_a": N_ENVS_A,
         "n_envs_b": N_ENVS_B,
         "n_envs_c": N_ENVS_C,
         "base_seed": BASE_SEED,
+        "defender_maintain_sla": DEFENDER_MAINTAIN_SLA,
+        "attacker_invalid_action_reward_modifier": ATTACKER_INVALID_ACTION_REWARD_MODIFIER,
+        "attacker_invalid_action_reward_multiplier": ATTACKER_INVALID_ACTION_REWARD_MULTIPLIER,
+        "defender_invalid_action_reward": DEFENDER_INVALID_ACTION_REWARD,
+        "defender_reset_on_constraint_broken": DEFENDER_RESET_ON_CONSTRAINT_BROKEN,
         "attacker_n_steps": ATTACKER_N_STEPS,
         "defender_n_steps": DEFENDER_N_STEPS,
         "batch_size": BATCH_SIZE,
@@ -203,7 +226,8 @@ def train(
         "anneal_alpha": ANNEAL_ALPHA,
     }
 
-    with log_run(RUN_NAME, "train", hyperparams, run_dir=run_dir, also_print=also_print) as (run_path, _log_path):
+    base_dir = Path(__file__).resolve().parent
+    with log_run(RUN_NAME, "train", hyperparams, run_dir=run_dir, base_dir=base_dir, also_print=also_print) as (run_path, _log_path):
         attacker_save_path = run_path / ATTACKER_MODEL_FILENAME
         defender_save_path = run_path / DEFENDER_MODEL_FILENAME
         checkpoint_root = run_path / CHECKPOINTS_SUBDIR
@@ -232,15 +256,31 @@ def train(
         attacker_lr = simulated_annealing_schedule(LEARNING_RATE_START)
         defender_lr = simulated_annealing_schedule(LEARNING_RATE_START)
 
-        attacker_model = PPO(
-            "MultiInputPolicy",
-            attacker_vec_env,
-            n_steps=ATTACKER_N_STEPS,
-            batch_size=BATCH_SIZE,
-            n_epochs=N_EPOCHS,
-            learning_rate=attacker_lr,
-            verbose=1,
-        )
+        if USE_ACTION_MASKING:
+            from sb3_contrib import MaskablePPO
+            from sb3_contrib.common.maskable.policies import MaskableMultiInputActorCriticPolicy
+
+            attacker_model = MaskablePPO(
+                MaskableMultiInputActorCriticPolicy,
+                attacker_vec_env,
+                n_steps=ATTACKER_N_STEPS,
+                batch_size=BATCH_SIZE,
+                n_epochs=N_EPOCHS,
+                learning_rate=attacker_lr,
+                stats_window_size=STATS_WINDOW_SIZE,
+                verbose=1,
+            )
+        else:
+            attacker_model = PPO(
+                "MultiInputPolicy",
+                attacker_vec_env,
+                n_steps=ATTACKER_N_STEPS,
+                batch_size=BATCH_SIZE,
+                n_epochs=N_EPOCHS,
+                learning_rate=attacker_lr,
+                stats_window_size=STATS_WINDOW_SIZE,
+                verbose=1,
+            )
         defender_model = PPO(
             "MultiInputPolicy",
             defender_vec_env,
@@ -248,6 +288,7 @@ def train(
             batch_size=BATCH_SIZE,
             n_epochs=N_EPOCHS,
             learning_rate=defender_lr,
+            stats_window_size=STATS_WINDOW_SIZE,
             verbose=1,
         )
 
@@ -285,8 +326,8 @@ def train(
         print(f"Saved defender model to {defender_save_path}")
 
         if evaluate_after:
-            from marlon.baseline_models.ppo import eval_marl
-            eval_marl.evaluate(run_dir=run_path, also_print=also_print)
+            from marlon.baseline_models.ppo_multi import eval_marl_multi
+            eval_marl_multi.evaluate(run_dir=run_path, also_print=also_print)
 
         return run_path
 
